@@ -8,7 +8,7 @@ from torch.utils.data import DataLoader
 
 from deepec.process_data import read_EC_actual_Fasta
 from deepec.data_loader import DeepECDataset
-from deepec.utils import argument_parser, run_neural_net, save_dl_result
+from deepec.utils import argument_parser, run_neural_net, save_dl_result, run_neural_net_with_xai
 from deepec.homology import run_blastp, read_best_blast_result, merge_predictions
 
 
@@ -50,7 +50,8 @@ if __name__ == '__main__':
     proteinDataset = DeepECDataset(data_X=input_seqs, data_Y=pseudo_labels, explainECs=explainECs, pred=True)
     proteinDataloader = DataLoader(proteinDataset, batch_size=batch_size, shuffle=False)
 
-    y_pred, y_score = run_neural_net(model, proteinDataloader, pred_thrd, device=device)
+    #y_pred, y_score = run_neural_net(model, proteinDataloader, pred_thrd, device=device)
+    y_pred, y_score, shap_values = run_neural_net_with_shap_and_plots(model, proteinDataloader, pred_thrd, device=device, output_dir = './xai_results')
     failed_cases = save_dl_result(y_pred, y_score, input_ids, explainECs, output_dir+'/tmp')
 
     if len(failed_cases) > 0:

@@ -6,6 +6,11 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from tqdm.auto import tqdm
+import os
+
+import pandas as pd
+import lime
+import lime.lime_tabular
 
 
 # import torch packages
@@ -169,3 +174,220 @@ def save_dl_result(y_pred, y_score, input_ids, explainECs, output_dir):
                 pred_score = y_score[i][j].item()
                 fp.write(f'{input_ids[i]}\t{pred_ec}\t{pred_score:0.4f}\n')
     return failed_cases
+
+
+class MultilabelLIMEExplainer:
+    def __init__(self, model, device, feature_names, class_names):
+        """
+        Wrapper for LIME Tabular Explainer to handle multilabel classification.
+
+        Args:
+            model: The PyTorch model to explain.
+            device: Device to run the model on (CPU/GPU).
+            feature_names: List of feature names.
+            class_names: List of class (label) names.
+        """
+        self.model = model
+        self.device = device
+        self.feature_names = feature_names
+        self.class_names = class_names
+
+    def make_classifier_pipeline(self, label_index):
+        """
+        Creates a classifier pipeline for a specific label.
+
+        Args:
+            label_index: Index of the label to explain.
+
+        Returns:
+            A prediction function for LIME that outputs probabilities for the specific label.
+        """
+        def lime_explainer_pipeline(input_data):
+            input_tensor = torch.tensor(input_data).to(self.device).long()
+            with torch.no_grad():
+                outputs = self.model(input_ids=input_tensor)
+                outputs = torch.sigmoid(outputs)  # Multilabel probabilities
+                prob_true = outputs[:, label_index].cpu().numpy()
+                prob_false = 1 - prob_true
+                return np.vstack([prob_false, prob_true]).T  # Return probabilities as [P(false), P(true)]
+
+        return lime_explainer_pipeline
+
+    def get_highest_probability_label(self, instance):
+        input_tensor = torch.tensor(instance).unsqueeze(0).to(self.device).long()
+        with torch.no_grad():
+            outputs = self.model(input_ids=input_tensor)
+            probabilities = torch.sigmoid(outputs)
+        return probabilities.argmax().item()
+
+    def explain_instance(self, instance, explainer, num_features=10, num_samples=100):
+        highest_prob_index = self.get_highest_probability_label(instance)
+        label_name = self.class_names[highest_prob_index]
+        classifier_fn = self.make_classifier_pipeline(highest_prob_index)
+        exp = explainer.explain_instance(
+            instance,
+            classifier_fn,
+            num_features=num_features,
+            num_samples=num_samples
+        )
+
+        return {label_name: dict(exp.local_exp[1])}
+
+
+    def explain_instanc_all_labels(self, instance, explainer, num_features=10, num_samples=500):
+        """
+        Explains an instance for all labels using LIME.
+
+        Args:
+            instance: Single data instance to explain.
+            explainer: LIME Tabular Explainer object.
+            num_features: Number of features to include in the explanation.
+            num_samples: Number of samples to generate in LIME.
+
+        Returns:
+            Dictionary of explanations for each label.
+        """
+        explanations = {}
+        
+        # Loop through each label and explain it
+        for label_index, label_name in enumerate(self.class_names):
+            classifier_fn = self.make_classifier_pipeline(label_index)
+            
+            exp = explainer.explain_instance(
+                instance,
+                classifier_fn,
+                num_features=num_features,
+                num_samples=num_samples
+            )
+            
+            explanations[label_name] = dict(exp.local_exp[1])  # Use index `1` because it's the "true" class
+        
+        return explanations
+
+def run_neural_net_with_xai(
+    model,
+    proteinDataloader,
+    pred_thrd,
+    device,
+    num_features=10,
+    num_samples=500,
+    output_dir='./lime_plots_multilabel'
+):
+    os.makedirs(output_dir, exist_ok=True)
+
+    num_data = len(proteinDataloader.dataset)
+    num_ecs = len(model.explainECs)  # Use the number of labels from model.explainECs
+    pred_thrd = pred_thrd.to(device)
+
+    model.eval()
+
+    y_pred = torch.zeros([num_data, num_ecs])
+    y_score = torch.zeros([num_data, num_ecs])
+
+    logging.info('Deep learning prediction starts on the dataset')
+
+    cnt = 0
+    all_inputs = []
+    local_explanations_df = pd.DataFrame()
+
+    with torch.no_grad():
+        for batch, data in enumerate(tqdm(proteinDataloader)):
+            inputs = {key: val.to(device) for key, val in data.items()}
+            output = model(**inputs)
+            output = torch.sigmoid(output)  # Use sigmoid for multilabel classification
+
+            prediction = output > pred_thrd
+            prediction = prediction.float()
+            step = data['input_ids'].shape[0]
+            y_pred[cnt:cnt+step] = prediction.cpu()
+            y_score[cnt:cnt+step] = output.cpu()
+
+            all_inputs.append(inputs['input_ids'].cpu())
+
+            cnt += step
+
+    logging.info('Deep learning prediction ended on test dataset')
+
+    all_inputs_tensor = torch.cat(all_inputs, dim=0).cpu().numpy()
+
+    # Initialize feature and class names
+    feature_names = [f"Feature_{i}" for i in range(all_inputs_tensor.shape[1])]
+    ec_names = model.explainECs  # Use label names directly from model.explainECs
+
+    # Initialize Multilabel LIME Explainer
+    lime_explainer_wrapper = MultilabelLIMEExplainer(
+        model=model,
+        device=device,
+        feature_names=feature_names,
+        class_names=ec_names
+    )
+
+    # Create a LIME Tabular Explainer object (shared across all labels)
+    explainer = lime.lime_tabular.LimeTabularExplainer(
+        all_inputs_tensor,
+        feature_names=feature_names,
+        class_names=["None", "True"],  # Binary classification per label
+        mode='classification'
+    )
+
+    logging.info('Computing LIME explanations...')
+
+    global_importance = np.zeros((num_ecs, len(feature_names)))
+    lime_explanations = []
+
+    for i in tqdm(range(min(500, len(all_inputs_tensor)))):
+        explanations_per_instance = lime_explainer_wrapper.explain_instance(
+            instance=all_inputs_tensor[i],
+            explainer=explainer,
+            num_features=num_features,
+            num_samples=num_samples
+        )
+    
+        lime_explanations.append(explanations_per_instance)
+
+
+        # Save local explanation for this instance to the DataFrame
+        instance_expl_df = pd.DataFrame({ 
+            "Instance": [i] * len(feature_names), 
+            "Feature": feature_names, 
+            "Importance": [explanations_per_instance[next(iter(explanations_per_instance))].get(f_idx, 0) for f_idx in range(len(feature_names))]
+        })
+        local_explanations_df = pd.concat([local_explanations_df, instance_expl_df], ignore_index=True)
+
+
+        # Aggregate global importance for the highest probability label
+        label_name, importance_dict = next(iter(explanations_per_instance.items()))
+        ec_idx = ec_names.index(label_name)
+        for feature_idx, value in importance_dict.items():
+            global_importance[ec_idx, feature_idx] += abs(value)
+
+
+    logging.info('LIME explanations computed.')
+
+    global_importance /= len(lime_explanations)
+
+    # Save results and plots per label (EC)
+    #for ec_idx, ec_name in enumerate(ec_names):
+    #    importance_df = pd.DataFrame({
+    #        'Feature': feature_names,
+    #        'Importance': global_importance[ec_idx]
+    #    })
+
+    # Create a single large DataFrame
+    importance_df = pd.DataFrame(global_importance, index=ec_names, columns=feature_names)
+    
+    # Sort columns by the sum of importance across all ECs
+    importance_df = importance_df.sort_values(by=importance_df.index.tolist(), axis=1, ascending=False)
+    
+    # Save global explanations
+    csv_path = os.path.join(output_dir, "global_feature_importance_all_ECs.csv")
+    importance_df.to_csv(csv_path)
+
+    # Save local explanations
+    csv_path_local = os.path.join(output_dir, "local_explanations.csv") 
+    local_explanations_df.to_csv(csv_path_local, index=False)
+    logging.info(f"Local explanations saved to {csv_path_local}")
+
+    logging.info(f"Global feature importance for all ECs saved to {csv_path}")
+
+    return y_pred, y_score, lime_explanations

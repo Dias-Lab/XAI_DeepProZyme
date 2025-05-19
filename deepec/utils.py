@@ -271,7 +271,7 @@ def run_neural_net_with_xai(
     device,
     num_features=10,
     num_samples=500,
-    output_dir='./lime_plots_multilabel'
+    output_dir='./xai_results'
 ):
     os.makedirs(output_dir, exist_ok=True)
 
